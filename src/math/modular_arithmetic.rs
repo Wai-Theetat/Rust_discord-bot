@@ -1,37 +1,35 @@
 //  (a + b) % m without overflowing u64.
 // if m == 0 -> panic
-pub fn add_mod(a:u64, b:u64, m:u64) -> u64 {
-	assert!(m != 0, "modulus cannot be zero");
+pub fn add_mod(a: u64, b: u64, m: u64) -> u64 {
+    assert!(m != 0, "modulus cannot be zero");
 
-	((a as u128 + b as u128) % m as u128) as u64
+    ((a as u128 + b as u128) % m as u128) as u64
 }
 
-pub fn mul_mod(a:u64, b:u64, m:u64) -> u64 {
-	assert!(m != 0, "modulus cannot be zero");
+pub fn mul_mod(a: u64, b: u64, m: u64) -> u64 {
+    assert!(m != 0, "modulus cannot be zero");
 
-	((a as u128 * b as u128) % m as u128) as u64
+    ((a as u128 * b as u128) % m as u128) as u64
 }
 
 /// Returns (base ^ exp) % m using square-and-multiply.
 pub fn pow_mod(mut base: u64, mut exp: u64, m: u64) -> u64 {
-	assert!(m != 0, "modulus cannot be zero");
+    assert!(m != 0, "modulus cannot be zero");
 
-	let mut result = 1 % m;
-	base %= m;
+    let mut result = 1 % m;
+    base %= m;
 
-	while exp > 0 {
-		if exp & 1 == 1 {
-			result = mul_mod(result, base, m);
-		}
+    while exp > 0 {
+        if exp & 1 == 1 {
+            result = mul_mod(result, base, m);
+        }
 
-		base = mul_mod(base, base, m);
-		exp >>= 1;
-	}
+        base = mul_mod(base, base, m);
+        exp >>= 1;
+    }
 
-	result
+    result
 }
-
-
 
 #[cfg(test)]
 mod tests {

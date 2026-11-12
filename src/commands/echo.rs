@@ -6,7 +6,9 @@ pub fn register() -> CreateCommand {
         .description("Repeat your text.")
         .add_option(
             CreateCommandOption::new(CommandOptionType::String, "text", "What to repeat")
-                .required(true),
+                .required(true)
+                // Discord messages are capped at 2000 characters.
+                .max_length(2000),
         )
 }
 

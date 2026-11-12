@@ -1,16 +1,9 @@
-
 use serenity::builder::{
-    CreateCommand,
-    CreateCommandOption,
-    CreateInteractionResponse,
-    CreateInteractionResponseMessage,
-    EditInteractionResponse,
+    CreateCommand, CreateCommandOption, CreateInteractionResponse,
+    CreateInteractionResponseMessage, EditInteractionResponse,
 };
 
-use serenity::model::application::{
-    CommandInteraction,
-    CommandOptionType,
-};
+use serenity::model::application::{CommandInteraction, CommandOptionType};
 
 use serenity::prelude::*;
 
@@ -33,24 +26,25 @@ pub fn register() -> CreateCommand {
 }
 
 pub async fn start(ctx: &Context, command: &CommandInteraction) {
-	let n = command
-		.data
-		.options
-		.iter()
-		.find(|option| option.name == "n")
-		.and_then(|option| option.value.as_str())
-		.and_then(|s| s.parse::<u64>().ok())
-		.filter(|&n| n >= 2);
+    let n = command
+        .data
+        .options
+        .iter()
+        .find(|option| option.name == "n")
+        .and_then(|option| option.value.as_str())
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .filter(|&n| n >= 2);
 
     let Some(n) = n else {
-        let _ = command.create_response(
-            &ctx.http,
-            CreateInteractionResponse::Message(
-                CreateInteractionResponseMessage::new()
-                    .content("Please provide an integer greater than or equal to 2.")
-                    .ephemeral(true),
-            ),
-        ).await;
+        let message = CreateInteractionResponseMessage::new()
+            .content("Please provide an integer greater than or equal to 2.")
+            .ephemeral(true);
+        if let Err(error) = command
+            .create_response(&ctx.http, CreateInteractionResponse::Message(message))
+            .await
+        {
+            eprintln!("Could not reply to /factor: {error}");
+        }
 
         return;
     };
@@ -73,10 +67,10 @@ pub async fn start(ctx: &Context, command: &CommandInteraction) {
         }
     };
 
-    if let Err(error) = command.edit_response(
-        &ctx.http,
-        EditInteractionResponse::new().content(response),
-    ).await {
+    if let Err(error) = command
+        .edit_response(&ctx.http, EditInteractionResponse::new().content(response))
+        .await
+    {
         eprintln!("Failed to edit factor response: {error}");
     }
 }

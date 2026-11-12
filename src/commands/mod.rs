@@ -1,12 +1,16 @@
-use serenity::builder::CreateCommand;
+use serenity::builder::{
+    CreateAllowedMentions, CreateCommand, CreateInteractionResponse,
+    CreateInteractionResponseMessage,
+};
 use serenity::model::application::CommandInteraction;
+use serenity::prelude::*;
 
+pub mod benchmark;
 pub mod cleanup;
 pub mod echo;
+pub mod factor;
 pub mod ping;
 pub mod roll;
-pub mod factor;
-pub mod benchmark;
 
 /// Every command definition sent to Discord on startup.
 pub fn all() -> Vec<CreateCommand> {
@@ -15,17 +19,39 @@ pub fn all() -> Vec<CreateCommand> {
         echo::register(),
         roll::register(),
         cleanup::register(),
-		factor::register(),
-		benchmark::register(),
+        factor::register(),
+        benchmark::register(),
     ]
 }
 
-pub fn run(command: &CommandInteraction) -> Option<String> {
-    match command.data.name.as_str() {
-        "ping" => Some(ping::run(command)),
-        "echo" => Some(echo::run(command)),
-        "roll" => Some(roll::run(command)),
+/// Route a slash command to its implementation.
+pub async fn handle(ctx: &Context, command: &CommandInteraction) {
+    let reply = match command.data.name.as_str() {
+        // Commands that manage their own responses.
+        "cleanup" => return cleanup::start(ctx, command).await,
+        "factor" => return factor::start(ctx, command).await,
+        "benchmark" => return benchmark::start(ctx, command).await,
 
-        _ => None,
+        // Commands that return a single text reply.
+        "ping" => ping::run(command),
+        "echo" => echo::run(command),
+        "roll" => roll::run(command),
+
+        other => {
+            eprintln!("Unknown command: {other}");
+            return;
+        }
+    };
+
+    // Never let user-supplied text ping @everyone, roles or users.
+    let message = CreateInteractionResponseMessage::new()
+        .content(reply)
+        .allowed_mentions(CreateAllowedMentions::new());
+
+    if let Err(error) = command
+        .create_response(&ctx.http, CreateInteractionResponse::Message(message))
+        .await
+    {
+        eprintln!("Could not reply to /{}: {error}", command.data.name);
     }
 }
