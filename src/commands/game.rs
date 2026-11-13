@@ -11,6 +11,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bot_discord::games::launcher::{GameInfo, GameState, Resources};
+use bot_discord::games::mc_ping::PingInfo;
 use bot_discord::games::client::{LauncherClient, LauncherError};
 use bot_discord::games::manager::{StartOutcome, Status, StopOutcome};
 use serenity::builder::{
@@ -211,6 +212,10 @@ pub async fn handle(ctx: &Context, command: &CommandInteraction, games: &GameCon
         Action::Check => match launcher.state(&info.name).await {
             Ok(state) => {
                 let mut text = status_text(&info, &state.status);
+                if let Some(ping) = &state.ping {
+                    text.push('\n');
+                    text.push_str(&ping_text(ping));
+                }
                 if let Some(resources) = &state.resources {
                     text.push('\n');
                     text.push_str(&resources_text(resources));
@@ -547,6 +552,21 @@ pub(crate) fn escape_markdown(text: &str) -> String {
     escaped
 }
 
+/// Minecraft's own view, for `check`: latency, slots, version, MOTD.
+fn ping_text(ping: &PingInfo) -> String {
+    let mut text = format!(
+        "📶 Ping {} ms · Slots {}/{} · Version {}",
+        ping.latency_ms,
+        ping.online,
+        ping.max,
+        escape_markdown(&ping.version)
+    );
+    if !ping.motd.is_empty() {
+        text.push_str(&format!("\n💬 {}", escape_markdown(&ping.motd)));
+    }
+    text
+}
+
 /// RAM, CPU and start time for `check`.
 fn resources_text(r: &Resources) -> String {
     let pc_percent = if r.pc_memory_total > 0 {
@@ -636,6 +656,7 @@ mod tests {
             info: GameInfo { name: name.into(), port: 1, stop_timeout_secs: 30 },
             status,
             resources: None,
+            ping: None,
         }
     }
 
@@ -709,6 +730,15 @@ mod tests {
     fn unknown_game_lists_choices_and_neutralizes_backticks() {
         let text = unknown_game_text("a`b", &["gtnh", "terraria"]);
         assert_eq!(text, "Unknown game `a'b`. Available: gtnh, terraria");
+    }
+
+    #[test]
+    fn ping_line() {
+        let ping = PingInfo { latency_ms: 3, online: 1, max: 20, version: "1.7.10".into(), motd: "GT_New_Horizons".into() };
+        assert_eq!(ping_text(&ping), "📶 Ping 3 ms · Slots 1/20 · Version 1.7.10\n💬 GT\\_New\\_Horizons");
+
+        let no_motd = PingInfo { motd: String::new(), ..ping };
+        assert_eq!(ping_text(&no_motd), "📶 Ping 3 ms · Slots 1/20 · Version 1.7.10");
     }
 
     #[test]

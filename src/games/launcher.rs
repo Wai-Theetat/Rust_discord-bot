@@ -23,7 +23,9 @@ use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
 
+use super::config::GameKind;
 use super::manager::{Game, GameManager, StartOutcome, Status, StopOutcome};
+use super::mc_ping::{self, PingInfo};
 
 /// The launcher refuses to start with a shorter token than this.
 pub const MIN_TOKEN_LEN: usize = 16;
@@ -45,6 +47,9 @@ pub struct GameState {
 	/// RAM/CPU numbers while it runs. None when stopped or if they couldn't be read.
 	#[serde(default)]
 	pub resources: Option<Resources>,
+	/// Minecraft only, while running: what the multiplayer screen would show.
+	#[serde(default)]
+	pub ping: Option<PingInfo>,
 }
 
 /// Measured on the PC by the launcher.
@@ -167,7 +172,13 @@ async fn game_state(State(state): State<AppState>, Path(name): Path<String>) -> 
 		Some((pid, started_unix)) => measure(&state.system, pid, started_unix).await,
 		None => None,
 	};
-	Ok(Json(GameState { info: GameInfo::of(&game), status, resources }))
+	// Minecraft: ask the server itself, like the multiplayer screen does.
+	let ping = if game.config.kind == GameKind::Minecraft && matches!(status, Status::Running { .. }) {
+		mc_ping::ping(game.config.port).await.ok()
+	} else {
+		None
+	};
+	Ok(Json(GameState { info: GameInfo::of(&game), status, resources, ping }))
 }
 
 // ---------- RAM / CPU ----------

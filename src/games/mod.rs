@@ -8,3 +8,4 @@ pub mod config;
 pub mod events;
 pub mod launcher;
 pub mod manager;
+pub mod mc_ping;

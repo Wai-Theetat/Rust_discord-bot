@@ -314,6 +314,7 @@ mod tests {
 			info: bot_discord::games::launcher::GameInfo { name: "gtnh".into(), port: 25565, stop_timeout_secs: 180 },
 			status: running(&["Steve"], 60),
 			resources: None,
+			ping: None,
 		};
 		let text = board_text(&state);
 		assert!(text.starts_with("🟢 **gtnh** is online"), "{text}");
