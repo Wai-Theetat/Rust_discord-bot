@@ -9,6 +9,8 @@ pub mod benchmark;
 pub mod cleanup;
 pub mod echo;
 pub mod factor;
+pub mod game;
+pub mod get_ip;
 pub mod ping;
 pub mod roll;
 
@@ -21,16 +23,20 @@ pub fn all() -> Vec<CreateCommand> {
         cleanup::register(),
         factor::register(),
         benchmark::register(),
+        game::register(),
+        get_ip::register(),
     ]
 }
 
 /// Route a slash command to its implementation.
-pub async fn handle(ctx: &Context, command: &CommandInteraction) {
+pub async fn handle(ctx: &Context, command: &CommandInteraction, games: &game::GameContext) {
     let reply = match command.data.name.as_str() {
         // Commands that manage their own responses.
         "cleanup" => return cleanup::start(ctx, command).await,
         "factor" => return factor::start(ctx, command).await,
         "benchmark" => return benchmark::start(ctx, command).await,
+        game::NAME => return game::handle(ctx, command, games).await,
+        get_ip::NAME => return get_ip::handle(ctx, command, games).await,
 
         // Commands that return a single text reply.
         "ping" => ping::run(command),

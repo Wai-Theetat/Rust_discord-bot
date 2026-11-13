@@ -7,7 +7,7 @@ use serenity::model::application::{
     ButtonStyle, CommandInteraction, CommandOptionType, ComponentInteraction,
 };
 use serenity::model::channel::Message;
-use serenity::model::id::{ChannelId, MessageId};
+use serenity::model::id::{ChannelId, MessageId, UserId};
 use serenity::model::permissions::Permissions;
 use serenity::prelude::*;
 
@@ -102,7 +102,7 @@ pub async fn start(ctx: &Context, command: &CommandInteraction) {
 
     let text = format!(
         "Delete **my** messages among the last {amount} in this channel? \
-		Messages from users and other bots stay."
+		Pinned messages and messages from users and other bots stay."
     );
     send_command_reply(ctx, command, text, Some(row)).await;
 }
@@ -199,6 +199,7 @@ async fn delete_own_messages(ctx: &Context, channel_id: ChannelId, amount: u32) 
     let mut scanned: u32 = 0;
     let mut deleted: u32 = 0;
     let mut failed: u32 = 0;
+    let mut kept_pinned: u32 = 0;
     let mut fetch_failed = false;
 
     while scanned < amount {
@@ -228,13 +229,20 @@ async fn delete_own_messages(ctx: &Context, channel_id: ChannelId, amount: u32) 
         // Newest first
         before = messages.last().map(|message| message.id);
 
-        let mine: Vec<&Message> = messages.iter().filter(|m| m.author.id == bot_id).collect();
+        kept_pinned += messages.iter().filter(|m| m.author.id == bot_id && m.pinned).count() as u32;
+        let mine: Vec<&Message> = messages
+            .iter()
+            .filter(|m| should_delete(m.author.id, bot_id, m.pinned))
+            .collect();
         let (ok, err) = delete_batch(ctx, channel_id, &mine).await;
         deleted += ok;
         failed += err;
     }
 
     let mut summary = format!("Scanned {scanned} messages. Deleted {deleted} of mine.");
+    if kept_pinned > 0 {
+        summary.push_str(&format!(" Kept {kept_pinned} pinned."));
+    }
     if failed > 0 {
         summary.push_str(&format!(" {failed} failed."));
     }
@@ -244,6 +252,11 @@ async fn delete_own_messages(ctx: &Context, channel_id: ChannelId, amount: u32) 
         );
     }
     summary
+}
+
+/// Only the bot's own messages, and never pinned ones (pinning = "keep this").
+fn should_delete(author: UserId, bot: UserId, pinned: bool) -> bool {
+    author == bot && !pinned
 }
 
 /// Delete messages, using one bulk request for those young enough.
@@ -288,6 +301,16 @@ async fn delete_batch(ctx: &Context, channel_id: ChannelId, messages: &[&Message
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn deletes_only_unpinned_own_messages() {
+        let bot = UserId::new(1);
+        let someone = UserId::new(2);
+        assert!(should_delete(bot, bot, false));
+        assert!(!should_delete(bot, bot, true), "pinned messages stay");
+        assert!(!should_delete(someone, bot, false), "other people's messages stay");
+        assert!(!should_delete(someone, bot, true));
+    }
 
     #[test]
     fn parses_confirm() {

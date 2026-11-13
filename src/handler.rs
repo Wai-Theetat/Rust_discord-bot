@@ -5,9 +5,11 @@ use serenity::model::id::GuildId;
 use serenity::prelude::*;
 
 use crate::commands;
+use crate::commands::game::GameContext;
 
 pub struct Handler {
     pub guild_id: GuildId,
+    pub games: GameContext,
 }
 
 #[async_trait]
@@ -19,11 +21,22 @@ impl EventHandler for Handler {
             Ok(list) => println!("Registered {} commands", list.len()),
             Err(err) => eprintln!("Could not register commands: {err}"),
         }
+
+        // Keep the live status channel updated. `ready` fires again after a
+        // reconnect; `start` only starts one loop.
+        if let Some(launcher) = &self.games.launcher {
+            self.games.board.start(ctx.http.clone(), launcher.clone());
+        }
     }
 
     async fn interaction_create(&self, ctx: Context, interaction: Interaction) {
         match interaction {
-            Interaction::Command(command) => commands::handle(&ctx, &command).await,
+            Interaction::Command(command) => commands::handle(&ctx, &command, &self.games).await,
+
+            // Suggestions while the user is still typing an option.
+            Interaction::Autocomplete(interaction) if interaction.data.name == commands::game::NAME => {
+                commands::game::autocomplete(&ctx, &interaction, &self.games).await;
+            }
 
             Interaction::Component(component) => {
                 if commands::cleanup::owns_button(&component.data.custom_id) {
