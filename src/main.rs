@@ -1,4 +1,5 @@
 mod commands;
+mod disabled;
 mod handler;
 mod math;
 mod status_board;
@@ -8,6 +9,7 @@ use std::sync::Arc;
 
 use bot_discord::games::client::LauncherClient;
 use commands::game::GameContext;
+use disabled::DisabledCommands;
 use handler::Handler;
 use serenity::model::id::{GuildId, RoleId, UserId};
 use serenity::prelude::*;
@@ -43,9 +45,10 @@ async fn main() {
         owner: owner_id(),
         board: Arc::new(StatusBoard::load(&data_dir)),
     };
+    let disabled = Arc::new(DisabledCommands::load(&data_dir));
 
     let mut client = Client::builder(&token, intents)
-        .event_handler(Handler { guild_id, games })
+        .event_handler(Handler { guild_id, games, disabled })
         .await
         .expect("Client Error.");
 

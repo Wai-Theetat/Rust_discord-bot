@@ -155,7 +155,7 @@ pub async fn handle(ctx: &Context, command: &CommandInteraction, games: &GameCon
     // Access first. Setup is owner-only (by user id, role not needed);
     // everything else needs the role. No member = used outside a server.
     let access = if action == Action::Setup {
-        check_setup_access(games.owner, command.user.id)
+        check_owner(games.owner, command.user.id)
     } else {
         let roles = command.member.as_ref().map(|member| member.roles.as_slice()).unwrap_or(&[]);
         check_access(games.role, roles)
@@ -467,12 +467,13 @@ fn option_str<'a>(command: &'a CommandInteraction, name: &str) -> Option<&'a str
 
 // ---------- pure helpers (tested below) ----------
 
-fn check_setup_access(owner: Option<UserId>, user: UserId) -> Result<(), String> {
+/// For owner-only actions (setup, /disable, /enable). Unset OWNER_ID = nobody.
+pub(crate) fn check_owner(owner: Option<UserId>, user: UserId) -> Result<(), String> {
     match owner {
         // Not configured = nobody (fail closed), same as GAME_ROLE_ID.
-        None => Err("`setup` isn't set up yet: the bot owner needs to set OWNER_ID.".to_string()),
+        None => Err("This isn't set up yet: the bot owner needs to set OWNER_ID.".to_string()),
         Some(owner) if owner == user => Ok(()),
-        Some(_) => Err("Only the bot owner can choose the status channel.".to_string()),
+        Some(_) => Err("Only the bot owner can do this.".to_string()),
     }
 }
 
@@ -697,11 +698,11 @@ mod tests {
     #[test]
     fn only_the_owner_can_setup() {
         let owner = Some(UserId::new(111111111111111111));
-        assert!(check_setup_access(owner, UserId::new(111111111111111111)).is_ok());
-        assert!(check_setup_access(owner, UserId::new(222222222222222222)).is_err());
-        assert!(check_setup_access(owner, UserId::new(1)).is_err());
+        assert!(check_owner(owner, UserId::new(111111111111111111)).is_ok());
+        assert!(check_owner(owner, UserId::new(222222222222222222)).is_err());
+        assert!(check_owner(owner, UserId::new(1)).is_err());
         // OWNER_ID missing: nobody, not everybody.
-        assert!(check_setup_access(None, UserId::new(111111111111111111)).is_err());
+        assert!(check_owner(None, UserId::new(111111111111111111)).is_err());
     }
 
     #[test]

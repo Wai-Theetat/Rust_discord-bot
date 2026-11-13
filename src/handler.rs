@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use serenity::async_trait;
 use serenity::model::application::Interaction;
 use serenity::model::gateway::Ready;
@@ -6,10 +8,13 @@ use serenity::prelude::*;
 
 use crate::commands;
 use crate::commands::game::GameContext;
+use crate::disabled::DisabledCommands;
 
 pub struct Handler {
     pub guild_id: GuildId,
     pub games: GameContext,
+    /// Commands switched off with /disable.
+    pub disabled: Arc<DisabledCommands>,
 }
 
 #[async_trait]
@@ -31,15 +36,23 @@ impl EventHandler for Handler {
 
     async fn interaction_create(&self, ctx: Context, interaction: Interaction) {
         match interaction {
-            Interaction::Command(command) => commands::handle(&ctx, &command, &self.games).await,
+            Interaction::Command(command) => {
+                commands::handle(&ctx, &command, &self.games, &self.disabled).await;
+            }
 
             // Suggestions while the user is still typing an option.
-            Interaction::Autocomplete(interaction) if interaction.data.name == commands::game::NAME => {
+            // (None while /game is disabled.)
+            Interaction::Autocomplete(interaction)
+                if interaction.data.name == commands::game::NAME
+                    && !self.disabled.is_disabled(commands::game::NAME) =>
+            {
                 commands::game::autocomplete(&ctx, &interaction, &self.games).await;
             }
 
+            // The Delete/Cancel buttons of a /cleanup that was started before
+            // /cleanup got disabled: block those too.
             Interaction::Component(component) => {
-                if commands::cleanup::owns_button(&component.data.custom_id) {
+                if commands::cleanup::owns_button(&component.data.custom_id) && !self.disabled.is_disabled("cleanup") {
                     commands::cleanup::handle_button(&ctx, &component).await;
                 }
             }
