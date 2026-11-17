@@ -4,10 +4,11 @@ use std::fmt;
 use std::time::Duration;
 
 use reqwest::{Client, Method, StatusCode};
+use serde::Serialize;
 use serde::de::DeserializeOwned;
 
-use super::launcher::{ErrorBody, GameInfo, GameState};
-use super::manager::{StartOutcome, StopOutcome};
+use super::launcher::{CommandRequest, ErrorBody, GameInfo, GameState};
+use super::manager::{ConsoleSnapshot, StartOutcome, StopOutcome};
 
 /// The game list. Short, because autocomplete must answer within 3 seconds.
 const LIST_TIMEOUT: Duration = Duration::from_secs(2);
@@ -18,6 +19,8 @@ const STATE_TIMEOUT: Duration = Duration::from_secs(5);
 const START_TIMEOUT: Duration = Duration::from_secs(60);
 /// Added on top of a game's stop_timeout_secs (covers the force-kill wait too).
 const STOP_EXTRA: Duration = Duration::from_secs(60);
+/// One console command. TShock REST commands answer within about a second.
+const COMMAND_TIMEOUT: Duration = Duration::from_secs(15);
 
 pub struct LauncherClient {
 	base_url: String,
@@ -78,12 +81,37 @@ impl LauncherClient {
 		self.call(Method::POST, game_path(name, "/restart")?, timeout).await
 	}
 
+	/// Console lines newer than `after` (for the console windows).
+	pub async fn console(&self, name: &str, after: u64) -> Result<ConsoleSnapshot, LauncherError> {
+		self.call(Method::GET, game_path(name, &format!("/console?after={after}"))?, STATE_TIMEOUT).await
+	}
+
+	/// Type one command into the server's console.
+	pub async fn command(&self, name: &str, command: &str) -> Result<(), LauncherError> {
+		let body = CommandRequest { command: command.to_string() };
+		self.send(Method::POST, game_path(name, "/command")?, COMMAND_TIMEOUT, Some(&body)).await
+	}
+
 	async fn call<T: DeserializeOwned>(&self, method: Method, path: String, timeout: Duration) -> Result<T, LauncherError> {
-		let response = self
+		self.send::<T, ()>(method, path, timeout, None).await
+	}
+
+	async fn send<T: DeserializeOwned, B: Serialize>(
+		&self,
+		method: Method,
+		path: String,
+		timeout: Duration,
+		body: Option<&B>,
+	) -> Result<T, LauncherError> {
+		let mut request = self
 			.http
 			.request(method, format!("{}{path}", self.base_url))
 			.bearer_auth(&self.token)
-			.timeout(timeout)
+			.timeout(timeout);
+		if let Some(body) = body {
+			request = request.json(body);
+		}
+		let response = request
 			.send()
 			.await
 			.map_err(|error| LauncherError::Unreachable(describe(&error)))?;

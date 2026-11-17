@@ -6,15 +6,18 @@
 //!   POST /games/{name}/start    -> StartOutcome
 //!   POST /games/{name}/stop     -> StopOutcome
 //!   POST /games/{name}/restart  -> StartOutcome
+//!   GET  /games/{name}/console?after=N -> ConsoleSnapshot   for the console windows
+//!   POST /games/{name}/command  {"command": "..."}       type into the server console
 //!
 //! Every request needs `Authorization: Bearer <LAUNCHER_TOKEN>`. The API can only
-//! start/stop/check games from games.toml: there is no "run this command" route,
-//! so even a leaked token can't run arbitrary programs.
+//! start/stop/check games from games.toml and type one-line commands into their
+//! consoles. There is no "run this program" route, so even a leaked token can't
+//! run arbitrary programs on the PC (it could still run game commands like `op`).
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
-use axum::extract::{Path, Request, State};
+use axum::extract::{Path, Query, Request, State};
 use axum::http::{StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -24,7 +27,7 @@ use serde::{Deserialize, Serialize};
 use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
 
 use super::config::GameKind;
-use super::manager::{Game, GameManager, StartOutcome, Status, StopOutcome};
+use super::manager::{ConsoleSnapshot, Game, GameManager, StartOutcome, Status, StopOutcome};
 use super::mc_ping::{self, PingInfo};
 
 /// The launcher refuses to start with a shorter token than this.
@@ -66,6 +69,19 @@ pub struct Resources {
 	pub started_unix: u64,
 }
 
+/// Body of `POST /games/{name}/command`.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CommandRequest {
+	pub command: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ConsoleQuery {
+	/// Only lines newer than this. 0 (the default) = everything kept.
+	#[serde(default)]
+	after: u64,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ErrorBody {
 	pub error: String,
@@ -90,16 +106,26 @@ struct AppState {
 	/// Kept between requests: CPU % is measured as the change since the last
 	/// refresh. None if the OS info couldn't be opened (then no RAM/CPU shown).
 	system: Arc<Mutex<Option<System>>>,
+	/// Open a console window whenever a server starts (off in tests).
+	open_consoles: bool,
 }
 
-pub fn router(manager: Arc<GameManager>, token: String) -> Router {
-	let state = AppState { manager, token: token.into(), system: Arc::new(Mutex::new(System::new().ok())) };
+/// `open_consoles`: open a console window for each server that starts.
+pub fn router(manager: Arc<GameManager>, token: String, open_consoles: bool) -> Router {
+	let state = AppState {
+		manager,
+		token: token.into(),
+		system: Arc::new(Mutex::new(System::new().ok())),
+		open_consoles,
+	};
 	Router::new()
 		.route("/games", get(list_games))
 		.route("/games/{name}", get(game_state))
 		.route("/games/{name}/start", post(start_game))
 		.route("/games/{name}/stop", post(stop_game))
 		.route("/games/{name}/restart", post(restart_game))
+		.route("/games/{name}/console", get(console_lines))
+		.route("/games/{name}/command", post(run_command))
 		// Runs before every route above.
 		.layer(middleware::from_fn_with_state(state.clone(), require_token))
 		.with_state(state)
@@ -255,7 +281,9 @@ fn process_tree(processes: impl Iterator<Item = (u32, Option<u32>)>, root: u32) 
 
 async fn start_game(State(state): State<AppState>, Path(name): Path<String>) -> Result<Json<StartOutcome>, ApiError> {
 	let game = find(&state, &name)?;
-	run_to_completion(async move { game.start().await }).await
+	let outcome = run_to_completion(async move { game.start().await }).await?;
+	after_start(&state, &name, &outcome);
+	Ok(outcome)
 }
 
 async fn stop_game(State(state): State<AppState>, Path(name): Path<String>) -> Result<Json<StopOutcome>, ApiError> {
@@ -265,7 +293,79 @@ async fn stop_game(State(state): State<AppState>, Path(name): Path<String>) -> R
 
 async fn restart_game(State(state): State<AppState>, Path(name): Path<String>) -> Result<Json<StartOutcome>, ApiError> {
 	let game = find(&state, &name)?;
-	run_to_completion(async move { game.restart().await }).await
+	let outcome = run_to_completion(async move { game.restart().await }).await?;
+	after_start(&state, &name, &outcome);
+	Ok(outcome)
+}
+
+/// A new run began: give it a console window.
+fn after_start(state: &AppState, name: &str, outcome: &StartOutcome) {
+	if state.open_consoles && *outcome == StartOutcome::Started {
+		open_console_window(name);
+	}
+}
+
+async fn console_lines(
+	State(state): State<AppState>,
+	Path(name): Path<String>,
+	Query(query): Query<ConsoleQuery>,
+) -> Result<Json<ConsoleSnapshot>, ApiError> {
+	let game = find(&state, &name)?;
+	Ok(Json(game.console(query.after).await))
+}
+
+async fn run_command(
+	State(state): State<AppState>,
+	Path(name): Path<String>,
+	Json(request): Json<CommandRequest>,
+) -> Result<Json<()>, ApiError> {
+	let game = find(&state, &name)?;
+	game.run_console_command(&request.command)
+		.await
+		.map(Json)
+		.map_err(|message| ApiError::new(StatusCode::BAD_REQUEST, message))
+}
+
+// ---------- console windows ----------
+
+/// Open a new window running this same program as `launcher console <name>`,
+/// which shows the server's output and sends what you type.
+///
+/// Goes through `cmd /c start` so the window gets its own console: a child
+/// started directly would keep writing into the launcher's window.
+fn open_console_window(name: &str) {
+	// The name ends up on a cmd command line: only allow characters cmd
+	// treats literally (no `&`, `|`, `%`, quotes...).
+	if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+		eprintln!("[launcher] {name}: name has special characters, not opening a console window");
+		return;
+	}
+	let exe = match std::env::current_exe() {
+		Ok(exe) => exe,
+		Err(error) => {
+			eprintln!("[launcher] {name}: could not open a console window: {error}");
+			return;
+		}
+	};
+	if !cfg!(windows) {
+		println!("[launcher] {name}: run `{} console {name}` to see its console", exe.display());
+		return;
+	}
+	// `start "<title>" <program> <args>`: the title has a space, so it is
+	// quoted, which is how `start` tells a title from the program.
+	let result = std::process::Command::new("cmd")
+		.args(["/c", "start", &format!("{name} console")])
+		.arg(&exe)
+		.args(["console", name])
+		.stdin(std::process::Stdio::null())
+		.stdout(std::process::Stdio::null())
+		.stderr(std::process::Stdio::null())
+		.status();
+	match result {
+		Ok(status) if status.success() => {}
+		Ok(status) => eprintln!("[launcher] {name}: could not open a console window ({status})"),
+		Err(error) => eprintln!("[launcher] {name}: could not open a console window: {error}"),
+	}
 }
 
 async fn run_to_completion<T, F>(work: F) -> Result<Json<T>, ApiError>
@@ -385,7 +485,7 @@ mod end_to_end {
 		let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
 		let url = format!("http://{}", listener.local_addr().unwrap());
 		tokio::spawn(async move {
-			axum::serve(listener, router(manager, TOKEN.to_string())).await.unwrap();
+			axum::serve(listener, router(manager, TOKEN.to_string(), false)).await.unwrap();
 		});
 		url
 	}
@@ -436,6 +536,40 @@ mod end_to_end {
 		assert_eq!(client.restart("fake", 5).await.unwrap(), StartOutcome::Started);
 		wait_until_running(&client).await;
 		assert_eq!(client.stop("fake", 5).await.unwrap(), StopOutcome::Stopped);
+	}
+
+	#[tokio::test]
+	async fn console_and_commands_over_http() {
+		let url = spawn_launcher("console").await;
+		let client = LauncherClient::new(&url, TOKEN);
+
+		client.start("fake").await.unwrap();
+		wait_until_running(&client).await;
+
+		let snapshot = client.console("fake", 0).await.unwrap();
+		assert!(snapshot.run_id.is_some());
+		assert!(snapshot.lines.iter().any(|l| l.text.contains("Steve joined")), "{:?}", snapshot.lines);
+
+		// A bad command is refused with the reason, and nothing is sent.
+		let error = client.command("fake", "say hi\nstop").await.unwrap_err();
+		assert!(matches!(&error, LauncherError::Failed(message) if message.contains("one line")), "{error:?}");
+
+		// `stop` typed in the window stops it, like in the real console.
+		client.command("fake", "stop").await.unwrap();
+		for _ in 0..200 {
+			if client.console("fake", 0).await.unwrap().run_id.is_none() {
+				break;
+			}
+			tokio::time::sleep(Duration::from_millis(50)).await;
+		}
+		let after = client.console("fake", 0).await.unwrap();
+		assert_eq!(after.run_id, None, "stopped");
+		assert!(after.lines.iter().any(|l| l.text == "> stop"), "{:?}", after.lines);
+		// Typed on purpose, so not a crash (no crash alert in Discord).
+		let Status::Stopped { last_exit: Some(exit) } = client.state("fake").await.unwrap().status else {
+			panic!("not stopped");
+		};
+		assert!(!exit.crashed, "typing `stop` is not a crash");
 	}
 
 	#[tokio::test]

@@ -3,3 +3,4 @@ target
 games.toml
 # Saved bot state (status channel)
 data/
+.claude

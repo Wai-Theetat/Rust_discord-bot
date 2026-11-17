@@ -45,6 +45,11 @@ const DEFAULT_TSHOCK_REST_PORT: u16 = 7878;
 /// Environment variable holding the TShock REST token (from .env).
 const TSHOCK_TOKEN_VAR: &str = "TSHOCK_REST_TOKEN";
 
+/// How many console lines each game keeps for its console window.
+const CONSOLE_LINES: usize = 500;
+/// Longest command accepted from a console window.
+pub const MAX_COMMAND_LEN: usize = 256;
+
 /// Every run gets a unique id, so tasks from an old run can't touch a newer one.
 static NEXT_RUN_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -108,6 +113,45 @@ pub enum StartOutcome {
 	AlreadyRunning(Status),
 }
 
+/// One console line, numbered so a console window can ask for "everything after N".
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ConsoleLine {
+	pub seq: u64,
+	pub text: String,
+}
+
+/// What a console window gets on each poll.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ConsoleSnapshot {
+	/// The current run, or None if the server isn't running. A window closes
+	/// once this changes, so a restart doesn't leave the old window behind.
+	pub run_id: Option<u64>,
+	/// Lines newer than the `after` that was asked for, oldest first.
+	pub lines: Vec<ConsoleLine>,
+}
+
+/// The last CONSOLE_LINES lines of a game, across runs (so the "stopped" line
+/// is still there after the run ends).
+#[derive(Default)]
+struct ConsoleLog {
+	lines: VecDeque<ConsoleLine>,
+	next_seq: u64,
+}
+
+impl ConsoleLog {
+	fn push(&mut self, text: String) {
+		if self.lines.len() == CONSOLE_LINES {
+			self.lines.pop_front();
+		}
+		self.next_seq += 1;
+		self.lines.push_back(ConsoleLine { seq: self.next_seq, text });
+	}
+
+	fn after(&self, seq: u64) -> Vec<ConsoleLine> {
+		self.lines.iter().filter(|line| line.seq > seq).cloned().collect()
+	}
+}
+
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
 pub enum StopOutcome {
 	NotRunning,
@@ -126,6 +170,8 @@ pub struct Game {
 	/// The run_id of the most recent run that exited. `stop()` subscribes to it
 	/// to wait for the exit without polling.
 	exits: watch::Sender<u64>,
+	/// For the console windows. A plain Mutex: it's only held to copy lines.
+	console: std::sync::Mutex<ConsoleLog>,
 }
 
 enum State {
@@ -157,6 +203,77 @@ impl Game {
 			config,
 			state: Mutex::new(State::Stopped { last_exit: None }),
 			exits: watch::channel(0).0,
+			console: std::sync::Mutex::new(ConsoleLog::default()),
+		}
+	}
+
+	/// Add a line to the console history.
+	fn log_console(&self, text: String) {
+		// A poisoned lock only means another thread panicked mid-push; the log is still usable.
+		self.console.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).push(text);
+	}
+
+	/// Console lines after `after` (0 = everything kept), plus the current run.
+	pub async fn console(&self, after: u64) -> ConsoleSnapshot {
+		let run_id = match &*self.state.lock().await {
+			State::Running(running) => Some(running.run_id),
+			State::Stopped { .. } => None,
+		};
+		let lines = self.console.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).after(after);
+		ConsoleSnapshot { run_id, lines }
+	}
+
+	/// Run one command typed in a console window, like typing it in the server's
+	/// own console. Minecraft: written to its console. Terraria: TShock ignores
+	/// piped input, so it goes through TShock's REST API instead.
+	pub async fn run_console_command(&self, command: &str) -> Result<(), String> {
+		let command = command.trim();
+		if command.is_empty() {
+			return Err("Type a command first.".to_string());
+		}
+		// One line only: a newline would sneak in a second command.
+		if command.chars().count() > MAX_COMMAND_LEN || command.chars().any(char::is_control) {
+			return Err(format!("Commands must be one line of at most {MAX_COMMAND_LEN} characters."));
+		}
+
+		self.log_console(format!("> {command}"));
+
+		// Typing the game's own stop command is a deliberate stop, not a crash
+		// (otherwise Discord would get a crash alert).
+		let stopping = is_stop_command(self.config.kind, command);
+		if stopping {
+			self.set_stop_requested(true).await;
+		}
+		let result = self.send_console_command(command).await;
+		if stopping && result.is_err() {
+			// It never reached the server, so it isn't stopping.
+			self.set_stop_requested(false).await;
+		}
+		result
+	}
+
+	async fn set_stop_requested(&self, value: bool) {
+		if let State::Running(running) = &mut *self.state.lock().await {
+			running.stop_requested = value;
+		}
+	}
+
+	async fn send_console_command(&self, command: &str) -> Result<(), String> {
+		match self.config.kind {
+			GameKind::Minecraft => self.send_command(command).await,
+			GameKind::Terraria => {
+				if !matches!(self.status().await, Status::Running { .. }) {
+					return Err(format!("{} is not running (or still starting)", self.name));
+				}
+				let token = std::env::var(TSHOCK_TOKEN_VAR).unwrap_or_default();
+				let port = self.config.rest_port.unwrap_or(DEFAULT_TSHOCK_REST_PORT);
+				// TShock's own console output isn't piped back for REST commands,
+				// so show its reply in the window instead.
+				for line in tshock_command(port, &token, command).await? {
+					self.log_console(line);
+				}
+				Ok(())
+			}
 		}
 	}
 
@@ -216,6 +333,7 @@ impl Game {
 		});
 		// Release the lock before the tasks start, since they lock it too.
 		drop(state);
+		self.log_console(format!("=== {} starting ===", self.name));
 
 		let readers = [
 			tokio::spawn(read_output(Arc::clone(self), run_id, stdout)),
@@ -348,6 +466,7 @@ impl Game {
 			None => {}
 		}
 
+		self.log_console(line.clone());
 		if running.recent.len() == RECENT_LINES {
 			running.recent.pop_front();
 		}
@@ -367,6 +486,9 @@ impl Game {
 			crashed: !running.stop_requested,
 			recent_lines: running.recent.iter().cloned().collect(),
 		};
+		let how = if last_exit.crashed { "crashed" } else { "stopped" };
+		let code = last_exit.code.map(|code| format!(", exit code {code}")).unwrap_or_default();
+		self.log_console(format!("=== {} {how}{code} ===", self.name));
 		*state = State::Stopped { last_exit: Some(last_exit) };
 		// Wake anyone waiting in `stop()`. send_replace works even with no listeners.
 		self.exits.send_replace(run_id);
@@ -430,6 +552,56 @@ fn parse_tshock_players(body: &str) -> Option<Vec<String>> {
 		.map(|name| name.chars().take(32).collect())
 		.collect();
 	Some(names)
+}
+
+/// The game's own "shut down" console commands.
+fn is_stop_command(kind: GameKind, command: &str) -> bool {
+	let word = command.split_whitespace().next().unwrap_or("").trim_start_matches('/').to_lowercase();
+	match kind {
+		GameKind::Minecraft => word == "stop",
+		GameKind::Terraria => matches!(word.as_str(), "off" | "exit" | "off-nosave" | "exit-nosave"),
+	}
+}
+
+/// Run one TShock command (like `kick Bob`) and return its reply lines.
+async fn tshock_command(port: u16, token: &str, command: &str) -> Result<Vec<String>, String> {
+	check_tshock_token(token)?;
+	// TShock only treats text starting with its command prefix as a command.
+	let command = if command.starts_with('/') { command.to_string() } else { format!("/{command}") };
+	let reply = http_get(port, &format!("/v3/server/rawcmd?token={token}&cmd={}", percent_encode(&command))).await?;
+	let body = reply.text.split("\r\n\r\n").nth(1).unwrap_or("");
+	// Never include the request path in errors: it contains the token.
+	parse_tshock_command_reply(body).map_err(|error| format!("TShock: {}", truncate(&error, 200)))
+}
+
+/// `{"status": "200", "response": ["line", ...]}` (a plain string in older versions).
+/// Anything else is an error with TShock's message.
+fn parse_tshock_command_reply(body: &str) -> Result<Vec<String>, String> {
+	let json: serde_json::Value =
+		serde_json::from_str(body.trim()).map_err(|_| "unexpected reply to the command".to_string())?;
+	if json["status"] != "200" {
+		let message = json["error"].as_str().unwrap_or("the command was refused");
+		return Err(message.to_string());
+	}
+	Ok(match &json["response"] {
+		serde_json::Value::Array(lines) => lines.iter().filter_map(|line| line.as_str().map(str::to_string)).collect(),
+		serde_json::Value::String(text) => text.lines().map(str::to_string).collect(),
+		_ => Vec::new(),
+	})
+}
+
+/// Escape everything except letters, digits and `-_.~`, so a command can't
+/// change the URL (e.g. add `&token=`).
+fn percent_encode(text: &str) -> String {
+	let mut encoded = String::with_capacity(text.len());
+	for byte in text.bytes() {
+		if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+			encoded.push(byte as char);
+		} else {
+			encoded.push_str(&format!("%{byte:02X}"));
+		}
+	}
+	encoded
 }
 
 /// The token goes into a URL, so only allow characters that need no escaping.
@@ -768,6 +940,34 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn console_window_sees_output_and_runs_commands() {
+		let script = format!("@echo off\n{DONE}\nset /p cmd=\necho got %cmd%\n");
+		let game = fake_server("console", &script);
+		game.start().await.unwrap();
+		wait_for(&game, "ready", |s| matches!(s, Status::Running { .. })).await;
+
+		let first = game.console(0).await;
+		assert!(first.run_id.is_some(), "running");
+		assert!(first.lines.iter().any(|l| l.text.contains("starting")), "{:?}", first.lines);
+		let seen = first.lines.last().unwrap().seq;
+
+		// Two commands in one line must be refused, not sent.
+		assert!(game.run_console_command("say hi\nstop").await.is_err());
+		assert!(game.run_console_command("   ").await.is_err());
+
+		game.run_console_command("hello").await.unwrap();
+		wait_for(&game, "stopped", |s| matches!(s, Status::Stopped { last_exit: Some(_) })).await;
+
+		let after = game.console(seen).await;
+		assert_eq!(after.run_id, None, "the window closes once the run is over");
+		let texts: Vec<&str> = after.lines.iter().map(|l| l.text.as_str()).collect();
+		assert!(texts.contains(&"> hello"), "{texts:?}");
+		assert!(texts.contains(&"got hello"), "{texts:?}");
+		assert!(texts.last().unwrap().contains("crashed"), "exited by itself: {texts:?}");
+		assert!(after.lines.iter().all(|l| l.seq > seen), "only new lines");
+	}
+
+	#[tokio::test]
 	async fn not_running_commands_fail_cleanly() {
 		let game = fake_server("idle", "@echo off\n");
 		assert!(game.send_command("stop").await.is_err());
@@ -1049,5 +1249,67 @@ mod tests {
 		// '&' would sneak extra parameters into the URL.
 		assert!(tshock_off(1, "abc&nosave=true").await.is_err());
 		assert!(tshock_off(1, "has space").await.is_err());
+	}
+}
+
+#[cfg(test)]
+mod console_tests {
+	use super::*;
+
+	#[test]
+	fn console_log_keeps_the_newest_lines_in_order() {
+		let mut log = ConsoleLog::default();
+		for n in 0..CONSOLE_LINES + 10 {
+			log.push(format!("line {n}"));
+		}
+		let all = log.after(0);
+		assert_eq!(all.len(), CONSOLE_LINES);
+		assert_eq!(all[0].text, "line 10", "the oldest lines are dropped");
+		assert!(all.windows(2).all(|w| w[0].seq + 1 == w[1].seq));
+
+		// Asking for "after the last one I saw" gives only the new lines.
+		let last = all.last().unwrap().seq;
+		assert!(log.after(last).is_empty());
+		log.push("new".into());
+		assert_eq!(log.after(last).iter().map(|l| l.text.as_str()).collect::<Vec<_>>(), ["new"]);
+	}
+
+	#[test]
+	fn percent_encode_keeps_commands_inside_one_parameter() {
+		assert_eq!(percent_encode("/kick Bob"), "%2Fkick%20Bob");
+		assert_eq!(percent_encode("a&token=x"), "a%26token%3Dx");
+		assert_eq!(percent_encode("ok-_.~9"), "ok-_.~9");
+		assert_eq!(percent_encode("ทด"), "%E0%B8%97%E0%B8%94");
+	}
+
+	#[test]
+	fn knows_each_games_stop_commands() {
+		assert!(is_stop_command(GameKind::Minecraft, "stop"));
+		assert!(is_stop_command(GameKind::Minecraft, "/STOP"));
+		assert!(!is_stop_command(GameKind::Minecraft, "say stop"));
+		assert!(!is_stop_command(GameKind::Minecraft, "off"));
+
+		for command in ["off", "/exit", "off-nosave", "Exit-NoSave"] {
+			assert!(is_stop_command(GameKind::Terraria, command), "{command}");
+		}
+		assert!(!is_stop_command(GameKind::Terraria, "kick off"));
+		assert!(!is_stop_command(GameKind::Terraria, "stop"));
+	}
+
+	#[test]
+	fn parses_tshock_command_replies() {
+		assert_eq!(
+			parse_tshock_command_reply(r#"{"status": "200", "response": ["Kicked Bob", "done"]}"#),
+			Ok(vec!["Kicked Bob".to_string(), "done".to_string()])
+		);
+		assert_eq!(
+			parse_tshock_command_reply(r#"{"status": "200", "response": "one\ntwo"}"#),
+			Ok(vec!["one".to_string(), "two".to_string()])
+		);
+		assert_eq!(
+			parse_tshock_command_reply(r#"{"status": "403", "error": "Not authorized."}"#),
+			Err("Not authorized.".to_string())
+		);
+		assert!(parse_tshock_command_reply("<html>").is_err());
 	}
 }
