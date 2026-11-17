@@ -10,7 +10,7 @@ A Discord bot written in Rust using [serenity](https://github.com/serenity-rs/se
 - **Non-blocking**: CPU-heavy work runs in `tokio::task::spawn_blocking`, so the bot stays responsive
 - **Safe cleanup**: confirm/cancel buttons that only the person who ran the command can press; deletes only the bot's own messages
 - **Mention-safe replies**: user text never pings `@everyone`, roles or users
-- **31 unit tests** covering the math and button parsing
+- **31 unit tests** covering the math and button parsing, with code review and test design assisted by Claude
 - **Docker** multi-stage build with dependency caching
 
 ## Commands
@@ -142,6 +142,14 @@ src/
 | Commands don't appear | Refresh Discord (`Ctrl+R`) and check the Guild ID. |
 | Can't see `/cleanup` | It is hidden from members without Manage Messages. A server admin can change this under **Server Settings → Integrations**. |
 | `/cleanup` deletes slowly | Give the bot **Manage Messages** so it can bulk-delete. Messages older than 14 days are always deleted one at a time (Discord limit). |
+
+## Development workflow
+
+I wrote the bot and the factorization engine myself. I used [Claude](https://claude.ai) (Anthropic's AI assistant) as a reviewer and testing partner, and for writing commit messages:
+
+- **Code review**: Claude reviewed the code for bugs, edge cases and Rust idioms, and I applied the fixes I agreed with (see the *Apply code review fixes* commit).
+- **Testing**: Claude helped design the unit tests, such as known factorizations, `u64::MAX`, large semiprimes and prime squares, a sweep of every `n` below 20,000, and button ID parsing. It also helped me run and check `cargo test`.
+- **Commit messages**: Claude helped me write clear, descriptive commit messages and readme.
 
 ## Security
 
